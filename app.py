@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     quantity INTEGER NOT NULL,
     price_per_subscriber REAL NOT NULL,
     total_price REAL NOT NULL,
-    payment_status TEXT NOT NULL DEFAULT 'waiting',   -- waiting, proof_sent, paid, rejected
-    status TEXT NOT NULL DEFAULT 'pending',           -- pending, active, finished, rejected
+    payment_status TEXT NOT NULL DEFAULT 'waiting',
+    status TEXT NOT NULL DEFAULT 'pending',
     proof_type TEXT,
     proof_file_id TEXT,
     proof_note TEXT,
@@ -126,9 +126,38 @@ CREATE TABLE IF NOT EXISTS channel_checks (
 """
 
 
+async def column_exists(db, table_name: str, column_name: str) -> bool:
+    cur = await db.execute(f"PRAGMA table_info({table_name})")
+    rows = await cur.fetchall()
+    return any(row[1] == column_name for row in rows)
+
+
+async def ensure_column(db, table_name: str, column_name: str, column_sql: str):
+    if not await column_exists(db, table_name, column_name):
+        await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES_SQL)
+
+        # миграции для старых баз
+        await ensure_column(db, "users", "username", "TEXT")
+        await ensure_column(db, "users", "full_name", "TEXT")
+        await ensure_column(db, "users", "is_admin_chat", "INTEGER NOT NULL DEFAULT 0")
+
+        await ensure_column(db, "tariffs", "is_active", "INTEGER NOT NULL DEFAULT 1")
+
+        await ensure_column(db, "campaigns", "owner_username", "TEXT")
+        await ensure_column(db, "campaigns", "payment_status", "TEXT NOT NULL DEFAULT 'waiting'")
+        await ensure_column(db, "campaigns", "proof_type", "TEXT")
+        await ensure_column(db, "campaigns", "proof_file_id", "TEXT")
+        await ensure_column(db, "campaigns", "proof_note", "TEXT")
+        await ensure_column(db, "campaigns", "paid_at", "TIMESTAMP")
+
+        await ensure_column(db, "vip_users", "username", "TEXT")
+        await ensure_column(db, "vip_users", "granted_by", "INTEGER")
+        await ensure_column(db, "vip_users", "is_active", "INTEGER NOT NULL DEFAULT 1")
 
         cur = await db.execute("SELECT COUNT(*) FROM tariffs")
         count = (await cur.fetchone())[0]
@@ -163,7 +192,6 @@ async def init_db():
 
 async def register_user(user, admin_chat: bool = False):
     async with aiosqlite.connect(DB_PATH) as db:
-        current_admin_flag = 1 if admin_chat else 0
         await db.execute(
             """
             INSERT INTO users (user_id, username, full_name, is_admin_chat)
@@ -171,41 +199,39 @@ async def register_user(user, admin_chat: bool = False):
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 full_name=excluded.full_name,
-                is_admin_chat=CASE
-                    WHEN excluded.is_admin_chat=1 THEN 1
-                    ELSE users.is_admin_chat
-                END
+                is_admin_chat=excluded.is_admin_chat
             """,
             (
                 user.id,
                 user.username,
                 user.full_name,
-                current_admin_flag,
+                1 if admin_chat else 0,
             ),
         )
         await db.commit()
 
 
 async def get_admin_chat_ids() -> List[int]:
-    if not ADMINS_USERNAMES:
-        return []
-
-    placeholders = ",".join("?" for _ in ADMINS_USERNAMES)
-    usernames = [x.lstrip("@") for x in ADMINS_USERNAMES]
-
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            f"""
-            SELECT user_id
+            """
+            SELECT user_id, username, is_admin_chat
             FROM users
             WHERE is_admin_chat=1
-              AND username IS NOT NULL
-              AND lower(username) IN ({placeholders})
-            """,
-            usernames,
+            """
         )
         rows = await cur.fetchall()
-        return [row[0] for row in rows]
+
+    admin_ids = []
+    allowed_usernames = {x.lstrip("@").lower() for x in ADMINS_USERNAMES}
+
+    for user_id, username, _is_admin_chat in rows:
+        if not username:
+            continue
+        if username.lower() in allowed_usernames:
+            admin_ids.append(user_id)
+
+    return admin_ids
 
 
 async def get_setting(key: str) -> Optional[str]:
@@ -346,6 +372,21 @@ async def list_paid_campaigns():
         return await cur.fetchall()
 
 
+async def list_hot_receipts():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, owner_user_id, owner_username, channel_title, channel_link,
+                   quantity, total_price, payment_status, proof_type, proof_file_id,
+                   proof_note, created_at
+            FROM campaigns
+            WHERE payment_status='proof_sent'
+            ORDER BY id DESC
+            """
+        )
+        return await cur.fetchall()
+
+
 async def set_campaign_status(campaign_id: int, status: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -475,9 +516,6 @@ async def find_user_by_username(username: str):
 
 
 async def get_finance_summary() -> Tuple[float, float, int, float]:
-    """
-    total_paid, vip_pool, active_vip_count, equal_share
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT COALESCE(SUM(total_price), 0) FROM campaigns WHERE payment_status='paid'"
@@ -588,6 +626,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="💳 Заголовок оплаты", callback_data="admin_set_payment_title")
     kb.button(text="💰 Реквизиты оплаты", callback_data="admin_set_payment_details")
     kb.button(text="📝 Примечание к оплате", callback_data="admin_set_payment_note")
+    kb.button(text="🔥 Горящие чеки", callback_data="admin_hot_receipts")
     kb.button(text="🕐 Ожидающие заявки", callback_data="admin_pending")
     kb.button(text="✅ Активировать заявку", callback_data="admin_activate_campaign")
     kb.button(text="👑 Список VIP", callback_data="admin_vip_list")
@@ -624,14 +663,37 @@ def proof_admin_kb(campaign_id: int, user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def hot_receipt_item_kb(campaign_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить оплату",
+                    callback_data=f"approve_pay:{campaign_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Выдать VIP",
+                    callback_data=f"grant_vip_from_campaign:{campaign_id}:{user_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить чек",
+                    callback_data=f"reject_pay:{campaign_id}"
+                )
+            ],
+        ]
+    )
+
+
 async def send_proof_to_admins(bot: Bot, campaign_id: int):
     campaign = await get_campaign(campaign_id)
     if not campaign:
         return
 
     admin_chat_ids = await get_admin_chat_ids()
-    if not admin_chat_ids:
-        return
 
     (
         _id,
@@ -651,7 +713,7 @@ async def send_proof_to_admins(bot: Bot, campaign_id: int):
     ) = campaign
 
     caption = (
-        "💳 Новый чек по заявке\n\n"
+        "🔥 Новый чек на проверку\n\n"
         f"Заявка: #{campaign_id}\n"
         f"Пользователь: {username_or_id(owner_user_id, owner_username)}\n"
         f"user_id: {owner_user_id}\n"
@@ -664,7 +726,9 @@ async def send_proof_to_admins(bot: Bot, campaign_id: int):
     )
 
     if proof_note:
-        caption += f"\nКомментарий пользователя:\n{proof_note}\n"
+        caption += f"\nКомментарий:\n{proof_note}\n"
+
+    sent_count = 0
 
     for admin_id in admin_chat_ids:
         try:
@@ -682,8 +746,15 @@ async def send_proof_to_admins(bot: Bot, campaign_id: int):
                     caption=caption,
                     reply_markup=proof_admin_kb(campaign_id, owner_user_id),
                 )
-        except Exception:
-            pass
+            sent_count += 1
+        except Exception as e:
+            logging.exception(f"Не удалось отправить чек админу {admin_id}: {e}")
+
+    if sent_count == 0:
+        logging.warning(
+            f"Чек по заявке #{campaign_id} не был отправлен ни одному админу. "
+            f"Проверь, нажимали ли админы /start у бота."
+        )
 
 
 # =========================
@@ -994,7 +1065,7 @@ async def active_ads_handler(call: CallbackQuery):
         await call.answer()
         return
 
-    lines = ["📣 Активные наборы/каналы:\n"]
+    lines = ["📣 Активные рекламы:\n"]
     for campaign_id, title, username, link, quantity, total_price in campaigns[:30]:
         channel_ref = f"@{username}" if username else link
         lines.append(
@@ -1273,6 +1344,118 @@ async def admin_pending_handler(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data == "admin_hot_receipts")
+async def admin_hot_receipts_handler(call: CallbackQuery):
+    if not is_admin_user(call.from_user):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    receipts = await list_hot_receipts()
+    if not receipts:
+        await call.message.edit_text(
+            "🔥 Горящих чеков нет.",
+            reply_markup=admin_menu_kb()
+        )
+        await call.answer()
+        return
+
+    kb = InlineKeyboardBuilder()
+    text_lines = ["🔥 Горящие чеки:\n"]
+
+    for row in receipts[:20]:
+        (
+            campaign_id,
+            owner_user_id,
+            owner_username,
+            _channel_title,
+            _channel_link,
+            _quantity,
+            total_price,
+            _payment_status,
+            _proof_type,
+            _proof_file_id,
+            _proof_note,
+            _created_at,
+        ) = row
+
+        text_lines.append(
+            f"#{campaign_id} — {username_or_id(owner_user_id, owner_username)} — {total_price:.2f} ₽"
+        )
+        kb.button(
+            text=f"Открыть чек #{campaign_id}",
+            callback_data=f"open_receipt:{campaign_id}"
+        )
+
+    kb.button(text="⬅️ Назад", callback_data="admin_menu")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        "\n".join(text_lines),
+        reply_markup=kb.as_markup()
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("open_receipt:"))
+async def open_receipt_handler(call: CallbackQuery):
+    if not is_admin_user(call.from_user):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    campaign_id = int(call.data.split(":")[1])
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        await call.answer("Чек не найден.", show_alert=True)
+        return
+
+    (
+        _id,
+        owner_user_id,
+        owner_username,
+        channel_title,
+        _channel_username,
+        channel_link,
+        quantity,
+        _pps,
+        total_price,
+        payment_status,
+        status,
+        proof_type,
+        proof_file_id,
+        proof_note,
+    ) = campaign
+
+    caption = (
+        f"🔥 Чек по заявке #{campaign_id}\n\n"
+        f"Пользователь: {username_or_id(owner_user_id, owner_username)}\n"
+        f"user_id: {owner_user_id}\n"
+        f"Канал: {channel_title}\n"
+        f"Ссылка: {channel_link}\n"
+        f"Количество: {quantity}\n"
+        f"Сумма: {total_price:.2f} ₽\n"
+        f"Оплата: {payment_status}\n"
+        f"Статус: {status}\n"
+    )
+
+    if proof_note:
+        caption += f"\nКомментарий:\n{proof_note}"
+
+    if proof_type == "photo":
+        await call.message.answer_photo(
+            proof_file_id,
+            caption=caption,
+            reply_markup=hot_receipt_item_kb(campaign_id, owner_user_id)
+        )
+    else:
+        await call.message.answer_document(
+            proof_file_id,
+            caption=caption,
+            reply_markup=hot_receipt_item_kb(campaign_id, owner_user_id)
+        )
+
+    await call.answer()
+
+
 @dp.callback_query(F.data == "admin_activate_campaign")
 async def admin_activate_campaign_handler(call: CallbackQuery, state: FSMContext):
     if not is_admin_user(call.from_user):
@@ -1303,7 +1486,7 @@ async def admin_activate_campaign_id(message: Message, state: FSMContext):
     if campaign[9] != "paid":
         await message.answer(
             "Эта заявка еще не подтверждена как оплаченная.\n"
-            "Сначала подтверди чек кнопкой из админского сообщения."
+            "Сначала подтверди чек кнопкой из админского сообщения или в разделе «Горящие чеки»."
         )
         return
 
